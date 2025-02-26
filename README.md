@@ -1,3 +1,5 @@
+loraだけ保存するべきでは? 保存している． 読み込みのときは?
+
 # Erasing Concepts from Diffusion Models
 ###  [Project Website](https://erasing.baulab.info) | [Arxiv Preprint](https://arxiv.org/pdf/2303.07345.pdf) | [Fine-tuned Weights](https://erasing.baulab.info/weights/esd_models/) | [Demo](https://huggingface.co/spaces/baulab/Erasing-Concepts-In-Diffusion) <br>
 

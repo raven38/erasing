@@ -18,14 +18,15 @@ from diffusers.schedulers.scheduling_lms_discrete import LMSDiscreteScheduler
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 from utils.utils import *
 
-def train(erase_concept, erase_from, train_method, iterations, negative_guidance, lr, save_path, device):
+
+def train(erase_concept, erase_from, train_method, iterations, negative_guidance, lr, save_path, device, group_lasso_weight):
   
     nsteps = 50
 
-    diffuser = StableDiffuser(scheduler='DDIM').to(device)
+    diffuser = StableDiffuser(scheduler='DDIM').to(device) # StableDiffuser accept model_path as an argument
     diffuser.train()
 
-    finetuner = FineTunedModel(diffuser, train_method=train_method)
+    finetuner = FineTunedModelLoRA(diffuser, train_method=train_method)
 
     optimizer = torch.optim.Adam(finetuner.parameters(), lr=lr)
     criteria = torch.nn.MSELoss()
@@ -50,11 +51,7 @@ def train(erase_concept, erase_from, train_method, iterations, negative_guidance
     for e, f in zip(erase_concept, erase_from):
         erase_concept_.append([e,f])
     
-    
-    
     erase_concept = erase_concept_
-    
-    
     
     print(erase_concept)
 
@@ -106,7 +103,15 @@ def train(erase_concept, erase_from, train_method, iterations, negative_guidance
         neutral_latents.requires_grad = False
         
 
-        loss = criteria(negative_latents, target_latents - (negative_guidance*(positive_latents - neutral_latents))) 
+        esd_loss = criteria(negative_latents, target_latents - (negative_guidance*(positive_latents - neutral_latents))) 
+        # Group Lasso損失の計算
+        if group_lasso_weight > 0.0:
+            with finetuner:
+                group_lasso_loss = calculate_group_lasso_loss(diffuser.unet) * group_lasso_weight
+        else:
+            group_lasso_loss = 0.0      
+
+        loss = esd_loss + group_lasso_loss  
         
         loss.backward()
         optimizer.step()
@@ -129,6 +134,7 @@ if __name__ == '__main__':
     parser.add_argument('--negative_guidance', help='Negative guidance value', type=float, required=False, default=1)
     parser.add_argument('--save_path', help='Path to save model', type=str, default='models/')
     parser.add_argument('--device', help='cuda device to train on', type=str, required=False, default='cuda:0')
+    parser.add_argument('--group_lasso_weight', help='Group Lasso weight', type=float, required=True, default=1.0)
 
     args = parser.parse_args()
     
@@ -141,9 +147,10 @@ if __name__ == '__main__':
     iterations = args.iterations #200
     negative_guidance = args.negative_guidance #1
     lr = args.lr #1e-5
-    name = f"esd-{erase_concept.lower().replace(' ','').replace(',','')}_from_{erase_from.lower().replace(' ','').replace(',','')}-{train_method}_{negative_guidance}-epochs_{iterations}"
+    group_lasso_weight = args.group_lasso_weight 
+    name = f"esd-lora-{erase_concept.lower().replace(' ','').replace(',','')}_from_{erase_from.lower().replace(' ','').replace(',','')}-{train_method}_{negative_guidance}-epochs_{iterations}"
     if not os.path.exists(args.save_path):
         os.makedirs(args.save_path, exist_ok = True)
     save_path = f'{args.save_path}/{name}.pt'
     device = args.device
-    train(erase_concept=erase_concept, erase_from=erase_from, train_method=train_method, iterations=iterations, negative_guidance=negative_guidance, lr=lr, save_path=save_path, device=device)
+    train(erase_concept=erase_concept, erase_from=erase_from, train_method=train_method, iterations=iterations, negative_guidance=negative_guidance, lr=lr, save_path=save_path, device=device, group_lasso_weight=group_lasso_weight)

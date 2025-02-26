@@ -17,6 +17,38 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from diffusers.schedulers.scheduling_lms_discrete import LMSDiscreteScheduler
 from diffusers.pipelines.stable_diffusion import StableDiffusionSafetyChecker
 
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict
+from diffusers.utils import convert_state_dict_to_diffusers
+
+def calculate_group_lasso_loss(model):
+    """
+    LoRAのパラメータに対してGroup Lassoを計算する関数
+    
+    Args:
+        model: LoRAアダプターを持つモデル
+        
+    Returns:
+        group_lasso_loss: 各グループのL2ノルムの平方根の総和
+    """
+    group_lasso_loss = 0.0
+
+    def module_norm(module, layer_name):
+        if hasattr(module, layer_name):
+            param = getattr(module, layer_name).weight
+            if param.requires_grad:
+                l2_norm = torch.sum(param**2)
+                return torch.sqrt(l2_norm)
+        return 0.0
+    
+    # 各LoRAレイヤーをグループとして集める
+    for name, module in model.named_modules():
+        group_lasso_loss += module_norm(module, "lora_A")
+        group_lasso_loss += module_norm(module, "lora_B")
+    
+    return group_lasso_loss
+
+
 def to_gif(images, path):
 
     images[0].save(path, save_all=True,
@@ -111,34 +143,33 @@ def get_concat_v(im1, im2):
 class StableDiffuser(torch.nn.Module):
 
     def __init__(self,
-                scheduler='LMS'
+                scheduler='LMS',
+                model_path="CompVis/stable-diffusion-v1-4",
+                clip_model="openai/clip-vit-large-patch14",
         ):
 
         super().__init__()
 
         # Load the autoencoder model which will be used to decode the latents into image space.
         self.vae = AutoencoderKL.from_pretrained(
-            "CompVis/stable-diffusion-v1-4", subfolder="vae")
+            model_path, subfolder="vae")
         
         # Load the tokenizer and text encoder to tokenize and encode the text.
-        self.tokenizer = CLIPTokenizer.from_pretrained(
-            "openai/clip-vit-large-patch14")
-        self.text_encoder = CLIPTextModel.from_pretrained(
-            "openai/clip-vit-large-patch14")
+        self.tokenizer = CLIPTokenizer.from_pretrained(clip_model)
+        self.text_encoder = CLIPTextModel.from_pretrained(clip_model)
         
         # The UNet model for generating the latents.
-        self.unet = UNet2DConditionModel.from_pretrained(
-            "CompVis/stable-diffusion-v1-4", subfolder="unet")
+        self.unet = UNet2DConditionModel.from_pretrained(model_path, subfolder="unet")
         
-        self.feature_extractor = CLIPFeatureExtractor.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="feature_extractor")
-        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="safety_checker")
+        self.feature_extractor = CLIPFeatureExtractor.from_pretrained(model_path, subfolder="feature_extractor")
+        self.safety_checker = StableDiffusionSafetyChecker.from_pretrained(model_path, subfolder="safety_checker")
 
         if scheduler == 'LMS':
             self.scheduler = LMSDiscreteScheduler(beta_start=0.00085, beta_end=0.012, beta_schedule="scaled_linear", num_train_timesteps=1000)
         elif scheduler == 'DDIM':
-            self.scheduler = DDIMScheduler.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="scheduler")
+            self.scheduler = DDIMScheduler.from_pretrained(model_path, subfolder="scheduler")
         elif scheduler == 'DDPM':
-            self.scheduler = DDPMScheduler.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="scheduler")    
+            self.scheduler = DDPMScheduler.from_pretrained(model_path, subfolder="scheduler")    
 
         self.eval()
 
@@ -428,3 +459,107 @@ class FineTunedModel(torch.nn.Module):
         for key, sd in state_dict.items():
             
             self.ft_modules[key].load_state_dict(sd)
+
+
+# Modified FineTunedModel to work with LoRA
+class FineTunedModelLoRA(torch.nn.Module):
+    def __init__(self,
+                model,
+                train_method,
+                rank=4
+                ):
+        super().__init__()
+        
+        self.model = model
+        self.train_method = train_method
+        
+        # Freeze all parameters
+        freeze(self.model)
+        
+        # Configure LoRA
+        if train_method == 'xattn':
+            # Only cross-attention modules
+            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
+            target_layers = lambda name: 'attn2' in name
+        elif train_method == 'xattn-strict':
+            # Stricter cross-attention (only query and key)
+            target_modules = ["to_k", "to_q"]
+            target_layers = lambda name: 'attn2' in name
+        elif train_method == 'noxattn':
+            # Everything except cross-attention
+            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
+            target_layers = lambda name: 'attn2' not in name
+        elif train_method == 'selfattn':
+            # Only self-attention
+            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
+            target_layers = lambda name: 'attn1' in name
+        elif train_method == 'full':
+            # All attention modules
+            target_modules = ["to_k", "to_q", "to_v", "to_out.0"]
+            target_layers = lambda name: True
+        else:
+            raise NotImplementedError(
+                f"train_method: {train_method} is not implemented."
+            )
+        
+        # Create and apply LoRA configuration
+        lora_config = LoraConfig(
+            r=rank,
+            lora_alpha=rank,
+            init_lora_weights="gaussian",
+            target_modules=target_modules,
+        )
+        
+        self.unet = self.model.unet
+        
+        # Add LoRA adapter
+        self.unet.add_adapter(lora_config)
+        
+        # Only unfreeze LoRA parameters
+        for name, param in self.unet.named_parameters():
+            if "lora" in name:
+                if target_layers(name):
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+                    
+        self.is_active = False
+                
+    @classmethod
+    def from_checkpoint(cls, model, checkpoint, train_method, rank=4):
+        ftm = FineTunedModelLoRA(model, train_method=train_method, rank=rank)
+        
+        if isinstance(checkpoint, str):
+            state_dict = torch.load(checkpoint)
+        else:
+            state_dict = checkpoint
+            
+        ftm.load_state_dict(state_dict)
+        return ftm
+        
+    def __enter__(self):
+        self.unet.enable_adapters()
+        self.is_active = True
+        return self
+        
+    def __exit__(self, exc_type, exc_value, tb):
+        self.unet.disable_adapters()
+        self.is_active = False
+        
+    def parameters(self):
+        params = []
+        for name, param in self.unet.named_parameters():
+            if param.requires_grad:
+                params.append(param)
+        return params
+        
+    def state_dict(self):
+        # Get state dict for only the LoRA parameters
+        unet_lora_state_dict = convert_state_dict_to_diffusers(
+            get_peft_model_state_dict(self.unet)
+        )
+        return unet_lora_state_dict
+        
+    def load_state_dict(self, state_dict):
+        # This would need to be adapted for the specific LoRA loading mechanism
+        self.unet.load_state_dict(state_dict, strict=False)
